@@ -236,7 +236,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 def main():
-    application = ApplicationBuilder().token("8139591798:AAGVOiWU4kaznZsladthZ1DXoh4gHid3kLU").build()
+    import os
+    application = ApplicationBuilder().token(os.getenv("8139591798:AAGVOiWU4kaznZsladthZ1DXoh4gHid3kLU")).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(stream_callback))
@@ -249,3 +250,4 @@ def main():
 if __name__ == '__main__':
     main()
 
+    

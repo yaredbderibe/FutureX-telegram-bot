@@ -11,9 +11,10 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
-from google.oauth2 import service_account
+import json
 
-creds = service_account.Credentials.from_service_account_file("sheets.json")
+with open("sheets.json", "r") as f:
+    data = json.load(f)
 
 
 # --- Configuration ---

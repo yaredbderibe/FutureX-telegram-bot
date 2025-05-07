@@ -1,253 +1,224 @@
 import logging
-import gspread
-import pandas as pd
-import asyncio
-from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import json
+import os
+import math
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
     ContextTypes,
+    ConversationHandler,
 )
-from telegram.constants import ParseMode
 
-# Configure logging
+# --- Configuration ---
+BOT_TOKEN = "8139591798:AAGVOiWU4kaznZsladthZ1DXoh4gHid3kLU"
+JSON_FILE_PATH = 'sheets.json'
+
+SUBJECT_ORDER = [
+    "English", "Mathematics", "Biology", "Physics",
+    "Chemistry", "Geography", "History", "Economics", "SAT"
+]
+
+MAX_SCORES = {
+    "English": 100,
+    "Mathematics": 65,
+    "Biology": 100,
+    "Physics": 60,
+    "Chemistry": 80,
+    "Geography": 100,
+    "History": 100,
+    "Economics": 80,
+    "SAT": 60
+}
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Google Sheets Setup
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-client = gspread.authorize(creds)
+ASKING_PHONE = range(1)
 
-# Course Configuration
-COURSE_SHEETS = {
-    "English": {"sheet_name": "English Model Exam I", "max_score": 100},
-    "Mathematics": {"sheet_name": "Mathematics Model Exam I", "max_score": 100},
-    "Biology": {"sheet_name": "Biology Model Exam I", "max_score": 100},
-    "Physics": {"sheet_name": "Physics Model Exam I", "max_score": 100},
-    "Chemistry": {"sheet_name": "Chemistry Model Exam I", "max_score": 100},
-    "History": {"sheet_name": "History Model Exam I", "max_score": 100},
-    "Economics": {"sheet_name": "Economics Model Exam I", "max_score": 100},
-    "Geography": {"sheet_name": "Geography Model Exam I", "max_score": 100},
-    "SAT": {"sheet_name": "SAT Model Exam I", "max_score": 100}
-}
-
-REQUIRED_COLUMNS = ['Name', 'Phone Number', 'Score']
-
-async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 1):
-    await asyncio.sleep(delay)
+def load_results_data(file_path: str) -> list | None:
+    if not os.path.exists(file_path):
+        logger.error(f"Error: JSON file not found at {file_path}")
+        return None
     try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        logger.warning(f"Could not delete message {message_id}: {e}")
-
-def normalize_score(score_str, max_score):
-    try:
-        if pd.isna(score_str) or score_str == "":
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            logger.error(f"Error: JSON data in {file_path} is not a list.")
             return None
-        if '/' in str(score_str):
-            obtained, total = map(float, str(score_str).split('/'))
-            percentage = (obtained / total) * 100
-        else:
-            percentage = (float(score_str) / max_score) * 100
-        return round(percentage, 1)
+        return data
+    except json.JSONDecodeError:
+        logger.error(f"Error: Could not decode JSON from {file_path}")
+        return None
     except Exception as e:
-        logger.error(f"Score normalization failed for '{score_str}': {str(e)}")
+        logger.error(f"An unexpected error occurred loading {file_path}: {e}")
         return None
 
-def get_student_data(phone):
-    results = {}
-    normalized_scores = {}
-    total_percentage = 0
-    subjects_taken = 0
-    name = None
-    detailed_errors = []
+def find_student_records(phone_number: str, data: list) -> list:
+    found_records = []
+    if not data:
+        return []
+    search_phone = phone_number.strip()
+    for record in data:
+        if record.get("Phone_number") and record["Phone_number"].strip() == search_phone:
+            found_records.append(record)
+    return found_records
 
-    for course, config in COURSE_SHEETS.items():
-        sheet_name = config["sheet_name"]
-        max_score = config["max_score"]
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "ሰላም! የፈተናዎን ውጤት ለማየት ስልክ ቁጥርዎን ያስገቡ።\n"
+    )
+    return ASKING_PHONE
 
-        try:
-            try:
-                sheet = client.open(sheet_name).sheet1
-                data = sheet.get_all_records()
-                df = pd.DataFrame(data)
-            except gspread.exceptions.SpreadsheetNotFound:
-                detailed_errors.append(f"{course}: Spreadsheet not found")
-                results[course] = "Sheet not available"
-                continue
-            except Exception as e:
-                detailed_errors.append(f"{course}: Could not access sheet - {str(e)}")
-                results[course] = "Data unavailable"
-                continue
+async def received_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    phone_number = update.message.text.strip()
+    user = update.message.from_user
+    logger.info(f"User {user.first_name} ({user.id}) entered phone number: {phone_number}")
 
-            missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-            if missing_cols:
-                detailed_errors.append(f"{course}: Missing columns - {', '.join(missing_cols)}")
-                results[course] = "Incomplete data"
-                continue
+    student_data = load_results_data(JSON_FILE_PATH)
 
-            df['Phone Number'] = (
-                df['Phone Number']
-                .astype(str)
-                .str.replace(r'\D', '', regex=True)
-                .str.lstrip('0')
+    if student_data is None:
+        await update.message.reply_text(
+            "እባኮትን ድጋሚ ይሞክሩ"
+        )
+        return ConversationHandler.END
+
+    student_records = find_student_records(phone_number, student_data)
+
+    if not student_records:
+        await update.message.reply_text(
+            f"ይቅርታ፣ በዚህ ስልክ ቁጥር {phone_number} የተመዘገበ ውጤት አልተገኘም።\n"
+            "እባክዎ ቁጥሩን ድጋሚ ያረጋግጡ አና ይላኩ።"
+        )
+    else:
+        scores_by_subject = {}
+        student_name = student_records[0].get("Name", "N/A")
+
+        for record in student_records:
+            subject = record.get("subject")
+            score = record.get("exam_score")
+            if subject and score is not None:
+                try:
+                    scores_by_subject[subject.strip()] = float(score)
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid score format '{score}' for subject '{subject}' and phone '{phone_number}'.")
+
+        response_message = "━━━━━━📚 ውጤት 📚━━━━━━\n"
+        response_message += f"📋የተማሪ ስም: {student_name} (ስልክ: {phone_number})\n"
+        response_message += "--------------------\n"
+
+        total_actual_score = 0.0
+        total_maximum_score = 0.0
+        total_percentage_sum = 0.0
+        subject_count = 0
+        found_any_results = False
+
+        for subject in SUBJECT_ORDER:
+            if subject in scores_by_subject:
+                actual_score = scores_by_subject[subject]
+                maximum_score = MAX_SCORES.get(subject)
+
+                score_display = ""
+                percentage = None
+                if maximum_score is not None:
+                    if maximum_score > 0:
+                        percentage = (actual_score / maximum_score) * 100
+                        score_display = f"{int(actual_score) if actual_score == int(actual_score) else actual_score}/{int(maximum_score)}  ({percentage:.1f}%)"
+
+                        total_actual_score += actual_score
+                        total_maximum_score += maximum_score
+                        total_percentage_sum += percentage
+                        subject_count += 1
+                    else:
+                        score_display = f"{actual_score}/0 (ስህተት: ከፍተኛ ውጤት 0 ነው)"
+                else:
+                    score_display = f"{actual_score} (ከፍተኛ ውጤት ያልተቀመጠ)"
+
+                response_message += f"📚የትምህርት አይነት: {subject}\n 📊ውጤት: {score_display}\n"
+                response_message += "--------------------\n"
+                found_any_results = True
+
+        average_percentage = 0.0
+        feedback_message = "ምንም አይነት አስተያየት ማቅረብ አልተቻለም።"
+        summary_block = ""
+
+        if subject_count > 0 and total_maximum_score > 0:
+            average_percentage = (total_actual_score / total_maximum_score) * 100
+
+            if average_percentage >= 85:
+                feedback_message = "🌟 እጅግ አስደናቂ ውጤት! በዚህ ውጤት የመጀመሪያ ምርጫ የሆነው ዩኒቨርሲቲ መግባት ይችላሉ።"
+            elif average_percentage >= 75:
+                feedback_message = "👍 በጣም ጥሩ ውጤት! የመጀመሪያ ወይም የሁለተኛ ምርጫ የሆነው ዩኒቨርሲቲ መግባት ይችላሉ።"
+            elif average_percentage >= 70:
+                feedback_message = "✅ ጥሩ ውጤት! ከመጀመሪያ እስከ አምስተኛ ምርጫ ላይ ያሉ ዩኒቨርሲቲዎች ውስጥ መግባት ይችላሉ።"
+            elif average_percentage >= 60:
+                feedback_message = "🤔 የበለጠ ሥራና ልምምድ ያስፈልጋል። እባክዎ ወደ ፈለጉት ዩኒቨርሲቲ ለመግባት ጠንክረው ይለማመዱ።"
+            elif average_percentage >= 50:
+                feedback_message = "⚠️ የማለፍ እና የመውደቅ እድልዎ 50/50 ነው። ስለማለፍዎ እርግጠኛ ለመሆን ተጨማሪ ልምምድ ያድርጉ።"
+            else:
+                feedback_message = "📉 አልተሳካም፣ ነገር ግን በትክክለኛ ክለሳ አና ጥያቄዎች በኋል ማለፍ ይቻላል በርታ/በርቺ።"
+
+            rounded_percentage_sum = math.ceil(total_percentage_sum)
+            max_percentage_total = subject_count * 100
+
+            summary_block += "```\n"
+            summary_block += f"🏆የጠቅላላ ውጤት: {rounded_percentage_sum} / {max_percentage_total} (ከ{subject_count} ትምህርት)\n"
+            summary_block += f"📊አማካይ ውጤት:          {average_percentage:.1f}%\n\n"
+            summary_block += f"{feedback_message}\n"
+            summary_block += "```"
+
+            response_message += f"\n{summary_block}"
+
+        elif found_any_results:
+            response_message += "\nበተገኙ ውጤቶች ላይ ያልተሟላ መረጃ ስለነበረ አጠቃላይ ውጤት መቆጣጠር አልተቻለም።"
+        else:
+            response_message = (
+                f"የተማሪ {student_name} ({phone_number}) ለመታየት ውጤት ተገኘ፣ "
+                f"ግን በየክፍሉ ውስጥ የሚያሳዩ ውጤቶች አልተገኙም።\n"
+                f"እባኮትን ድጋፍ ለማግኘት አግኙ።"
             )
 
-            student = df[df['Phone Number'] == phone]
+        await update.message.reply_text(response_message, parse_mode='Markdown')
 
-            if student.empty:
-                results[course] = "Exam not taken"
-                continue
+    return ConversationHandler.END
 
-            record = student.iloc[0]
-            if name is None:
-                name = record['Name']
-
-            score_value = record.get('Score')
-            normalized = normalize_score(score_value, max_score)
-
-            if normalized is None:
-                detailed_errors.append(f"{course}: Could not process score '{score_value}'")
-                results[course] = "Invalid score format"
-                continue
-
-            results[course] = f"{normalized}%"
-            normalized_scores[course] = normalized
-            total_percentage += normalized
-            subjects_taken += 1
-
-        except Exception as e:
-            logger.exception(f"Unexpected error processing {course}")
-            detailed_errors.append(f"{course}: Processing error")
-            results[course] = "System error"
-
-    return name, results, normalized_scores, total_percentage, subjects_taken, detailed_errors
-
-# ... all imports and configuration remain unchanged ...
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🌿 ናቸራል", callback_data="stream_natural")],
-        [InlineKeyboardButton("🌍 ሶሻል", callback_data="stream_social")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.message.from_user
+    logger.info(f"User {user.first_name} ({user.id}) canceled the conversation.")
     await update.message.reply_text(
-        "📚 FutureX የሞዴል ፈተና ውጤት\n\n"
-        "እባክዎ stream ይምረጡ",
-        reply_markup=reply_markup
+        'እሺ፣ ተቋርጧል።', reply_markup=ReplyKeyboardRemove()
     )
+    return ConversationHandler.END
 
-async def stream_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("ይቅርታ፣ /start ይሞክሩ።")
 
-    if query.data == "stream_natural":
-        context.user_data['stream'] = 'natural'
-        await query.edit_message_text("✅ የተመረጠው Stream: ናቸራል\n\nአሁን ውጤትዎን ለማየት ስልክ ቁጥርዎን ያስገቡ።")
-    elif query.data == "stream_social":
-        context.user_data['stream'] = 'social'
-        await query.edit_message_text("✅ የተመረጠው Stream: ሶሻል\n\nአሁን ውጤትዎን ለማየት ስልክ ቁጥርዎን ያስገቡ።")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if 'stream' not in context.user_data:
-        await update.message.reply_text("ℹ️ እባክዎ በመጀመሪያ /start በመጠቀም stream ይምረጡ።")
+def main() -> None:
+    try:
+        application = Application.builder().token(BOT_TOKEN).build()
+    except ValueError as e:
+        logger.error(f"Error initializing bot: {e}")
         return
 
-    stream = context.user_data['stream']
-    user_input = update.message.text.strip()
-    phone = ''.join(filter(str.isdigit, user_input)).lstrip('0')
-
-    if not phone or len(phone) < 7:
-        await update.message.reply_text("❌ እባክዎ ትክክለኛ የሆነ ስልክ ቁጥር ያስገቡ (ቢያንስ 7 አሃዞች።)")
-        return
-
-    processing_msg = await update.message.reply_text(
-        "⏳ እባክዎን 20 ሴኮንድ ይጠብቁ... ውጤቶን እየተረጋገጥን ነው።",
-        reply_to_message_id=update.message.message_id
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start), CommandHandler('results', start)],
+        states={ASKING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_phone_number)]},
+        fallbacks=[CommandHandler('cancel', cancel)],
     )
 
-    asyncio.create_task(delete_message_after_delay(context, processing_msg.chat_id, processing_msg.message_id))
+    application.add_handler(conv_handler)
+    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
-    name, results, normalized_scores, total_percentage, subjects_taken, detailed_errors = get_student_data(phone)
-
-    if not name:
-        error_message = (
-            "❌ ከዚህ ስልክ ቁጥር ጋር የተያያዘ ውጤት አልተገኘም።\n\n"
-            "ምክንያቶች ሊሆኑ ሚችሉ ነገሮች:\n"
-            "- ቁጥሩ አልተመዘገበም\n"
-            "- በቁጥሩ ኣጻጻፍ ውስጥ ስህተት አለ\n"
-            "- ውጤቶቹ ገና አልታወቁም"
-        )
-        if detailed_errors:
-            error_message += "\n\nተጨማሪ መረጃ:\n" + "\n".join(f"• {e}" for e in detailed_errors[:3])
-
-        result_msg = await update.message.reply_text(error_message)
-        asyncio.create_task(delete_message_after_delay(context, result_msg.chat_id, result_msg.message_id, 60))
-        return
-
-    message = "<b>━━━━━━📚 ውጤት 📚━━━━━━</b>\n\n"
-    message += f"📋 የተማሪ ስም: <b>{name}</b>\n\n📚 የፈተና ውጤት (ከ100):\n"
-
-    if stream == 'natural':
-        courses_to_display = ["English", "Mathematics", "Biology", "Physics", "Chemistry", "SAT"]
-    else:
-        courses_to_display = ["English", "Mathematics", "History", "Economics", "Geography", "SAT"]
-
-    for course in courses_to_display:
-        message += f"- {course}: {results.get(course, 'ውጤት አልተገኘም')}\n"
-
-    if subjects_taken > 0:
-        average_percentage = total_percentage / subjects_taken
-        message += (
-            f"\n<pre>"
-            f"🏆 አጠቃላይ ውጤት: {total_percentage:.1f}%  (ከ {subjects_taken} ትምህርቶች)\n"
-            f"📊 አማካይ ውጤት : {average_percentage:.1f}%"
-            f"</pre>\n"
-        )
-
-        if average_percentage >= 83:
-            message += "\n🎉 <b>አስደናቂ ውጤት! በዚህ ውጤት በመጀመሪያ ምርጫዎ ወደሆነው ዩኒቨርሲቲ መግባት ይችላሉ!</b>"
-        elif average_percentage >= 75:
-            message += "\n👍 <b>በጣም ጥሩ ውጤት! በዚህ ውጤት በመጀመሪያ ወይም በሁለተኛ ምርጫ ዩኒቨርሲቲ መግባት ይችላሉ!</b>"
-        elif average_percentage >= 65:
-            message += "\n👍 <b>ጥሩ ውጤት! በዚህ ውጤት አስከ አምስተኛ ምርጫ ድረስ ባሉት ዩኒቨርሲቲዎች ውስጥ መግባት ይችላሉ!</b>"
-        elif average_percentage >= 50:
-            message += "\n💪 <b>መካከለኛ ውጤት! የማለፍ እድሎ 50/50 ነው</b>"
-        else:
-            message += "\n🔍 <b>ዝቅ ያለ ውጤት ነው። ተጨማሪ ልምምድ ያስፈልጋል። በርታ/በርቺ ፥ ትችላለህ</b>"
-    else:
-        message += "\nℹ️ የዚህ ተማሪ ውጤቶች አልተገኙም።"
-
-    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
-    await update.message.reply_text(
-        "⚠️ ያልተጠበቀ ስህተት ተከስቷል። እባክዎ አንድ ጊዜ ተመልሰው ይሞክሩ።"
-    )
-
-def main():
-    import os
-    application = ApplicationBuilder().token(os.getenv("8139591798:AAGVOiWU4kaznZsladthZ1DXoh4gHid3kLU")).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(stream_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_error_handler(error_handler)
-
-    logger.info("🤖 Bot is running...")
-    application.run_polling()
+    logger.info("Starting bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot stopped.")
 
 if __name__ == '__main__':
+    if BOT_TOKEN.startswith("813959"):
+        logger.critical("CRITICAL WARNING: Replace this token immediately!")
     main()
-
-    

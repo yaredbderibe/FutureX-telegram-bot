@@ -11,6 +11,10 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
+from google.oauth2 import service_account
+
+creds = service_account.Credentials.from_service_account_file("sheets.json")
+
 
 # --- Configuration ---
 BOT_TOKEN = "8139591798:AAGVOiWU4kaznZsladthZ1DXoh4gHid3kLU"
